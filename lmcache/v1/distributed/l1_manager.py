@@ -17,12 +17,8 @@ from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.distributed.memory_manager import L1MemoryManager
 from lmcache.v1.memory_management import MemoryObj
-from lmcache.v1.mp_observability.logger.l1_stats_logger import (
-    L1ManagerStatsLogger,
-)
-from lmcache.v1.mp_observability.prometheus_controller import (
-    get_prometheus_controller,
-)
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import get_event_bus
 
 logger = init_logger(__name__)
 
@@ -173,10 +169,7 @@ class L1Manager:
 
         self._registered_listeners: list[L1ManagerListener] = []
 
-        # Self-register observability logger
-        l1_stats_logger = L1ManagerStatsLogger()
-        self.register_listener(l1_stats_logger)
-        get_prometheus_controller().register_logger(l1_stats_logger)
+        self._event_bus = get_event_bus()
 
     def register_listener(self, listener: L1ManagerListener) -> None:
         """Register a listener for L1Manager events.
@@ -237,6 +230,12 @@ class L1Manager:
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_reserved_read(successful_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_READ_RESERVED,
+                metadata={"keys": successful_keys},
+            )
+        )
         return ret
 
     @l1_mgr_synchronized
@@ -361,6 +360,18 @@ class L1Manager:
         for listener in self._registered_listeners:
             listener.on_l1_keys_read_finished(successful_keys)
             listener.on_l1_keys_deleted_by_manager(need_to_free_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_READ_FINISHED,
+                metadata={"keys": successful_keys},
+            )
+        )
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": need_to_free_keys},
+            )
+        )
 
         return ret
 
@@ -453,6 +464,12 @@ class L1Manager:
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_reserved_write(successful_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_WRITE_RESERVED,
+                metadata={"keys": successful_keys},
+            )
+        )
         return ret
 
     @l1_mgr_synchronized
@@ -506,12 +523,19 @@ class L1Manager:
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_write_finished(successful_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_WRITE_FINISHED,
+                metadata={"keys": successful_keys},
+            )
+        )
         return ret
 
     @l1_mgr_synchronized
     def finish_write_and_reserve_read(
         self,
         keys: list[ObjectKey],
+        extra_count: int = 0,
     ) -> dict[ObjectKey, L1OperationResult]:
         """Atomically finish write and acquire read lock for the given keys.
 
@@ -522,6 +546,10 @@ class L1Manager:
 
         Args:
             keys: Keys to transition from write-locked to read-locked.
+            extra_count: Extra read locks on top of the default 1 lock.
+                Total locks acquired per key = 1 + extra_count.  Useful
+                when multiple TP workers each consume one read lock for
+                the same key (e.g. MLA models with TP > 1).
 
         Returns:
             A dictionary mapping each object key to a tuple of
@@ -532,6 +560,8 @@ class L1Manager:
             KEY_IN_WRONG_STATE: The key is not write-locked, or it already
                 has read locks.
         """
+        extra_count = _validate_extra_count(extra_count)
+        total = 1 + extra_count
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
 
@@ -559,13 +589,19 @@ class L1Manager:
                 continue
 
             entry.write_lock.unlock()
-            entry.read_lock.lock()
+            for _ in range(total):
+                entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
 
         for listener in self._registered_listeners:
-            listener.on_l1_keys_write_finished(successful_keys)
-            listener.on_l1_keys_reserved_read(successful_keys)
+            listener.on_l1_keys_finish_write_and_reserve_read(successful_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_WRITE_FINISHED_AND_READ_RESERVED,
+                metadata={"keys": successful_keys},
+            )
+        )
         return ret
 
     @l1_mgr_synchronized
@@ -606,6 +642,12 @@ class L1Manager:
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_deleted_by_manager(successful_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": successful_keys},
+            )
+        )
         return ret
 
     @l1_mgr_synchronized
@@ -631,6 +673,12 @@ class L1Manager:
             self._objects.clear()
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_KEYS_EVICTED,
+                    metadata={"keys": all_keys},
+                )
+            )
             logger.info(
                 "L1Manager: cleared %d objects, 0 remaining.",
                 len(all_keys),
@@ -656,12 +704,37 @@ class L1Manager:
         if keys_to_clear:
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(keys_to_clear)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_KEYS_EVICTED,
+                    metadata={"keys": keys_to_clear},
+                )
+            )
 
         logger.info(
             "L1Manager: cleared %d objects, %d locked objects remaining.",
             len(keys_to_clear),
             locked_count,
         )
+
+    def is_key_evictable(self, key: ObjectKey) -> bool:
+        """Check if a key is eligible for eviction (not locked).
+
+        This method does NOT acquire the global L1Manager lock.
+        L1Manager.delete() will check again and safely reject a key
+        that became locked between the check and the actual deletion.
+
+        Args:
+            key: The object key to check.
+
+        Returns:
+            True if the key exists and is not locked (neither read-locked
+            nor write-locked), False otherwise.
+        """
+        entry = self._objects.get(key, None)
+        if entry is None:
+            return False
+        return not entry.read_lock.is_locked() and not entry.write_lock.is_locked()
 
     def get_memory_usage(self) -> tuple[int, int]:
         """Get the current memory usage of L1 cache.
@@ -687,6 +760,34 @@ class L1Manager:
             self._objects.clear()
 
         self._memory_manager.close()
+
+    # Status reporting
+    @l1_mgr_synchronized
+    def report_status(self) -> dict:
+        """Return a status dict describing L1 cache state."""
+        write_locked = 0
+        read_locked = 0
+        temporary = 0
+        for entry in self._objects.values():
+            if entry.write_lock.is_locked():
+                write_locked += 1
+            if entry.read_lock.is_locked():
+                read_locked += 1
+            if entry.is_temporary:
+                temporary += 1
+        used, total = self._memory_manager.get_memory_usage()
+        return {
+            "is_healthy": self._memory_manager.memcheck(),
+            "total_object_count": len(self._objects),
+            "write_locked_count": write_locked,
+            "read_locked_count": read_locked,
+            "temporary_count": temporary,
+            "memory_used_bytes": used,
+            "memory_total_bytes": total,
+            "memory_usage_ratio": used / total if total > 0 else 0.0,
+            "write_ttl_seconds": self._write_ttl_seconds,
+            "read_ttl_seconds": self._read_ttl_seconds,
+        }
 
     # Debugging APIs
     @l1_mgr_synchronized
